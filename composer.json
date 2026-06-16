@@ -1,0 +1,24 @@
+{
+  "name": "php-dev-router/php-dev-router",
+  "description": "Local HTTPS nginx router for PHP and Laravel development projects.",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.2"
+  },
+  "bin": [
+    "bin/php-dev-router"
+  ],
+  "scripts": {
+    "lint": "php -l bin/php-dev-router",
+    "scan": "bin/php-dev-router scan"
+  },
+  "keywords": [
+    "php",
+    "laravel",
+    "nginx",
+    "php-fpm",
+    "development",
+    "https"
+  ]
+}

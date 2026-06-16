@@ -1,0 +1,537 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+const VERSION = '1.0.0';
+const HOSTS_BEGIN = '# BEGIN php-dev-router';
+const HOSTS_END = '# END php-dev-router';
+
+main($argv);
+
+function main(array $argv): void
+{
+    $command = $argv[1] ?? 'help';
+    $options = parseOptions(array_slice($argv, 2));
+    $config = loadConfig($options['config'] ?? null);
+
+    try {
+        match ($command) {
+            'scan' => commandScan($config, $options),
+            'apply' => commandApply($config, $options),
+            'watch' => commandWatch($config, $options),
+            'doctor', 'status' => commandDoctor($config),
+            'install' => commandInstall($config, $options),
+            'help', '-h', '--help' => commandHelp(),
+            default => fail("Unknown command: {$command}\nRun: php-dev-router help"),
+        };
+    } catch (RuntimeException $exception) {
+        fwrite(STDERR, "php-dev-router: {$exception->getMessage()}\n");
+        exit(1);
+    }
+}
+
+function parseOptions(array $args): array
+{
+    $options = [];
+    foreach ($args as $arg) {
+        if (!str_starts_with($arg, '--')) {
+            $options['_'][] = $arg;
+            continue;
+        }
+
+        $arg = substr($arg, 2);
+        if (str_contains($arg, '=')) {
+            [$key, $value] = explode('=', $arg, 2);
+            $options[$key] = $value;
+        } else {
+            $options[$arg] = true;
+        }
+    }
+
+    return $options;
+}
+
+function loadConfig(?string $path): array
+{
+    $projectRoot = dirname(__DIR__);
+    $configPath = $path ? expandPath($path) : defaultConfigPath($projectRoot);
+    if (!is_file($configPath)) {
+        fail("Config file not found: {$configPath}");
+    }
+
+    $config = json_decode((string) file_get_contents($configPath), true);
+    if (!is_array($config)) {
+        fail("Config file is not valid JSON: {$configPath}");
+    }
+
+    $defaults = [
+        'projects_root' => getenv('HOME') . '/PhpstormProjects',
+        'domain' => 'php.test',
+        'ssl_certificate' => getenv('HOME') . '/.ssl/php-dev-router/fullchain.pem',
+        'ssl_certificate_key' => getenv('HOME') . '/.ssl/php-dev-router/privkey.pem',
+        'php_fpm_socket' => '/run/php-fpm/php-fpm.sock',
+        'nginx_conf' => '/etc/nginx/conf.d/php-dev-router.conf',
+        'hosts_file' => '/etc/hosts',
+        'systemd_service' => '/etc/systemd/system/php-dev-router.service',
+        'skip_dirs' => ['.git', '.idea', '.vscode', 'bootstrap/cache', 'node_modules', 'storage', 'vendor'],
+        'scan_max_depth' => 5,
+        'watch_interval_seconds' => 3,
+        'config_path' => $configPath,
+        'project_root' => $projectRoot,
+    ];
+
+    $config = array_replace($defaults, $config);
+    foreach (['projects_root', 'ssl_certificate', 'ssl_certificate_key', 'nginx_conf', 'hosts_file', 'systemd_service'] as $key) {
+        $config[$key] = expandPath((string) $config[$key]);
+    }
+    $config['domain'] = trim((string) $config['domain'], ". \t\n\r\0\x0B");
+    $config['scan_max_depth'] = max(1, (int) $config['scan_max_depth']);
+    $config['watch_interval_seconds'] = max(1, (int) $config['watch_interval_seconds']);
+
+    return $config;
+}
+
+function commandHelp(): void
+{
+    $version = VERSION;
+    echo <<<TEXT
+php-dev-router v{$version}
+
+Usage:
+  php-dev-router scan [--json]
+  php-dev-router apply [--dry-run] [--no-reload] [--no-nginx-test]
+  php-dev-router watch [--interval=3]
+  php-dev-router doctor
+  php-dev-router install [--dry-run]
+
+Commands:
+  scan      Discover PHP/Laravel apps and show hostnames.
+  apply     Generate nginx config and exact local hosts entries.
+  watch     Re-apply when the project inventory changes.
+  doctor    Check config, certs, services, generated files, and DNS.
+  install   Create the systemd service and run apply.
+
+TEXT;
+}
+
+function commandScan(array $config, array $options): void
+{
+    $apps = discoverApps($config);
+    if (isset($options['json'])) {
+        echo json_encode($apps, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+        return;
+    }
+
+    if ($apps === []) {
+        echo "No serveable PHP apps found in {$config['projects_root']}\n";
+        return;
+    }
+
+    foreach ($apps as $app) {
+        echo "{$app['host']} -> {$app['root']} ({$app['type']})\n";
+    }
+}
+
+function commandApply(array $config, array $options): void
+{
+    $apps = discoverApps($config);
+    $nginx = renderNginx($config, $apps);
+    $hosts = renderHostsBlock($apps);
+
+    if (isset($options['dry-run'])) {
+        echo "Would write nginx config: {$config['nginx_conf']}\n";
+        echo "Would update hosts file: {$config['hosts_file']}\n\n";
+        echo $nginx;
+        echo "\n";
+        echo $hosts;
+        return;
+    }
+
+    ensureWritableTargets([$config['nginx_conf'], $config['hosts_file']]);
+    atomicWrite($config['nginx_conf'], $nginx);
+    updateHostsFile($config['hosts_file'], $hosts);
+
+    if (empty($options['no-nginx-test'])) {
+        runOrFail(['nginx', '-t']);
+    }
+    if (empty($options['no-reload'])) {
+        reloadService('nginx');
+    }
+
+    echo "Applied " . count($apps) . " app route(s).\n";
+}
+
+function commandWatch(array $config, array $options): void
+{
+    $interval = isset($options['interval']) ? max(1, (int) $options['interval']) : $config['watch_interval_seconds'];
+    echo "Watching {$config['projects_root']} every {$interval}s\n";
+
+    $lastHash = '';
+    while (true) {
+        $apps = discoverApps($config);
+        $hash = hash('sha256', json_encode($apps, JSON_UNESCAPED_SLASHES));
+        if ($hash !== $lastHash) {
+            $lastHash = $hash;
+            try {
+                commandApply($config, ['no-reload' => false]);
+            } catch (RuntimeException $exception) {
+                fwrite(STDERR, date('c') . " apply failed: {$exception->getMessage()}\n");
+            }
+        }
+        sleep($interval);
+    }
+}
+
+function commandDoctor(array $config): void
+{
+    $apps = discoverApps($config);
+    $checks = [
+        ['Projects root', is_dir($config['projects_root']), $config['projects_root']],
+        ['SSL cert', is_file($config['ssl_certificate']), $config['ssl_certificate']],
+        ['SSL key', is_file($config['ssl_certificate_key']), $config['ssl_certificate_key']],
+        ['PHP-FPM socket', file_exists($config['php_fpm_socket']), $config['php_fpm_socket']],
+        ['nginx config dir', is_dir(dirname($config['nginx_conf'])), dirname($config['nginx_conf'])],
+        ['hosts file', is_file($config['hosts_file']), $config['hosts_file']],
+    ];
+
+    foreach ($checks as [$name, $ok, $detail]) {
+        echo sprintf("%-18s %s %s\n", $name, $ok ? 'OK  ' : 'MISS', $detail);
+    }
+
+    echo "\nDetected apps: " . count($apps) . "\n";
+    foreach ($apps as $app) {
+        $resolved = trim((string) shell_exec('getent hosts ' . escapeshellarg($app['host']) . ' 2>/dev/null'));
+        $dnsStatus = str_contains($resolved, '127.0.0.1') ? 'resolves' : 'not-local';
+        echo "  {$app['host']} -> {$app['root']} ({$dnsStatus})\n";
+    }
+}
+
+function commandInstall(array $config, array $options): void
+{
+    $service = renderSystemdService($config);
+
+    if (isset($options['dry-run'])) {
+        echo "Would write systemd service: {$config['systemd_service']}\n\n";
+        echo $service;
+        echo "\n";
+        commandApply($config, ['dry-run' => true]);
+        return;
+    }
+
+    ensureWritableTargets([$config['systemd_service'], $config['nginx_conf'], $config['hosts_file']]);
+    atomicWrite($config['systemd_service'], $service);
+    commandApply($config, ['no-reload' => false]);
+
+    runOrFail(['systemctl', 'daemon-reload']);
+    enableServiceIfAvailable('php-fpm');
+    enableServiceIfAvailable('nginx');
+    runOrFail(['systemctl', 'enable', '--now', 'php-dev-router.service']);
+
+    echo "Installed php-dev-router watcher service.\n";
+}
+
+function discoverApps(array $config): array
+{
+    $root = rtrim($config['projects_root'], '/');
+    if (!is_dir($root)) {
+        return [];
+    }
+
+    $candidates = [];
+    scanDirectory($root, $root, 0, $config, $candidates);
+
+    $usedHosts = [];
+    $apps = [];
+    foreach ($candidates as $candidate) {
+        $relative = trim(substr($candidate['app_dir'], strlen($root)), '/');
+        $slug = slugify($relative === '' ? basename($candidate['app_dir']) : $relative);
+        $host = "{$slug}.{$config['domain']}";
+        if (isset($usedHosts[$host])) {
+            $hash = substr(hash('sha1', $candidate['app_dir']), 0, 7);
+            $host = "{$slug}-{$hash}.{$config['domain']}";
+        }
+        $usedHosts[$host] = true;
+        $apps[] = [
+            'host' => $host,
+            'name' => $slug,
+            'type' => $candidate['type'],
+            'app_dir' => $candidate['app_dir'],
+            'root' => $candidate['root'],
+            'index' => $candidate['root'] . '/index.php',
+        ];
+    }
+
+    usort($apps, fn (array $a, array $b): int => strcmp($a['host'], $b['host']));
+    return $apps;
+}
+
+function scanDirectory(string $dir, string $base, int $depth, array $config, array &$candidates): void
+{
+    if ($depth > $config['scan_max_depth']) {
+        return;
+    }
+
+    $dir = rtrim($dir, '/');
+    if (is_file("{$dir}/public/index.php")) {
+        $type = is_file("{$dir}/artisan") ? 'laravel' : 'public-front-controller';
+        $candidates[] = ['app_dir' => $dir, 'root' => "{$dir}/public", 'type' => $type];
+    } elseif (is_file("{$dir}/index.php")) {
+        $candidates[] = ['app_dir' => $dir, 'root' => $dir, 'type' => 'generic-php'];
+    }
+
+    $children = @scandir($dir);
+    if ($children === false) {
+        return;
+    }
+
+    foreach ($children as $child) {
+        if ($child === '.' || $child === '..') {
+            continue;
+        }
+
+        $path = "{$dir}/{$child}";
+        if ($child === 'public' || str_starts_with($child, '.')) {
+            continue;
+        }
+        if (!is_dir($path) || shouldSkip($path, $base, $config['skip_dirs'])) {
+            continue;
+        }
+        scanDirectory($path, $base, $depth + 1, $config, $candidates);
+    }
+}
+
+function shouldSkip(string $path, string $base, array $skipDirs): bool
+{
+    $relative = trim(substr($path, strlen(rtrim($base, '/'))), '/');
+    $name = basename($path);
+    foreach ($skipDirs as $skip) {
+        $skip = trim((string) $skip, '/');
+        if ($skip === $name || $skip === $relative || str_ends_with($relative, "/{$skip}")) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function renderNginx(array $config, array $apps): string
+{
+    $lines = [
+        '# Managed by php-dev-router. Re-running apply replaces this file.',
+        '# Source: ' . $config['config_path'],
+        '',
+    ];
+
+    foreach ($apps as $app) {
+        $host = nginxEscape($app['host']);
+        $root = nginxEscape($app['root']);
+        $cert = nginxEscape($config['ssl_certificate']);
+        $key = nginxEscape($config['ssl_certificate_key']);
+        $socket = nginxEscape($config['php_fpm_socket']);
+
+        $lines[] = "server {";
+        $lines[] = "    listen 80;";
+        $lines[] = "    server_name {$host};";
+        $lines[] = "    return 301 https://{$host}\$request_uri;";
+        $lines[] = "}";
+        $lines[] = "";
+        $lines[] = "server {";
+        $lines[] = "    listen 443 ssl;";
+        $lines[] = "    server_name {$host};";
+        $lines[] = "";
+        $lines[] = "    ssl_certificate \"{$cert}\";";
+        $lines[] = "    ssl_certificate_key \"{$key}\";";
+        $lines[] = "";
+        $lines[] = "    root \"{$root}\";";
+        $lines[] = "    index index.php index.html;";
+        $lines[] = "";
+        $lines[] = "    client_max_body_size 128m;";
+        $lines[] = "";
+        $lines[] = "    location / {";
+        $lines[] = "        try_files \$uri \$uri/ /index.php?\$query_string;";
+        $lines[] = "    }";
+        $lines[] = "";
+        $lines[] = "    location ~ \\.php$ {";
+        $lines[] = "        try_files \$uri =404;";
+        $lines[] = "        fastcgi_pass unix:{$socket};";
+        $lines[] = "        fastcgi_index index.php;";
+        $lines[] = "        include fastcgi.conf;";
+        $lines[] = "    }";
+        $lines[] = "";
+        $lines[] = "    location ~ /\\.(?!well-known).* {";
+        $lines[] = "        deny all;";
+        $lines[] = "    }";
+        $lines[] = "}";
+        $lines[] = "";
+    }
+
+    return implode("\n", $lines);
+}
+
+function renderHostsBlock(array $apps): string
+{
+    $lines = [HOSTS_BEGIN];
+    foreach ($apps as $app) {
+        $lines[] = "127.0.0.1 {$app['host']}";
+    }
+    $lines[] = HOSTS_END;
+    $lines[] = '';
+    return implode("\n", $lines);
+}
+
+function updateHostsFile(string $path, string $block): void
+{
+    $current = is_file($path) ? (string) file_get_contents($path) : '';
+    $pattern = '/' . preg_quote(HOSTS_BEGIN, '/') . '.*?' . preg_quote(HOSTS_END, '/') . "\\n?/s";
+    if (preg_match($pattern, $current)) {
+        $new = preg_replace($pattern, $block, $current);
+    } else {
+        $new = rtrim($current) . "\n\n" . $block;
+    }
+
+    atomicWrite($path, (string) $new);
+}
+
+function renderSystemdService(array $config): string
+{
+    $php = trim((string) shell_exec('command -v php 2>/dev/null')) ?: '/usr/bin/php';
+    $script = __FILE__;
+    $configPath = $config['config_path'];
+    $interval = $config['watch_interval_seconds'];
+
+    return <<<UNIT
+[Unit]
+Description=PHP development router
+After=network.target nginx.service php-fpm.service
+Wants=nginx.service php-fpm.service
+
+[Service]
+Type=simple
+ExecStart={$php} {$script} watch --config={$configPath} --interval={$interval}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
+UNIT;
+}
+
+function defaultConfigPath(string $projectRoot): string
+{
+    $localConfig = "{$projectRoot}/config.json";
+    if (is_file($localConfig)) {
+        return $localConfig;
+    }
+
+    return "{$projectRoot}/config.example.json";
+}
+
+function atomicWrite(string $path, string $contents): void
+{
+    $dir = dirname($path);
+    if (!is_dir($dir) && !mkdir($dir, 0755, true) && !is_dir($dir)) {
+        fail("Could not create directory: {$dir}");
+    }
+
+    $mode = file_exists($path) ? (fileperms($path) & 0777) : 0644;
+    $owner = file_exists($path) ? fileowner($path) : false;
+    $group = file_exists($path) ? filegroup($path) : false;
+    $tmp = tempnam($dir, '.php-dev-router.');
+    if ($tmp === false) {
+        fail("Could not create temp file in {$dir}");
+    }
+    if (file_put_contents($tmp, $contents) === false) {
+        @unlink($tmp);
+        fail("Could not write temp file: {$tmp}");
+    }
+    @chmod($tmp, $mode);
+    if ($owner !== false) {
+        @chown($tmp, $owner);
+    }
+    if ($group !== false) {
+        @chgrp($tmp, $group);
+    }
+    if (!rename($tmp, $path)) {
+        @unlink($tmp);
+        fail("Could not replace file: {$path}");
+    }
+    @chmod($path, $mode);
+}
+
+function runOrFail(array $command): void
+{
+    $escaped = array_map('escapeshellarg', $command);
+    $cmd = implode(' ', $escaped) . ' 2>&1';
+    exec($cmd, $output, $code);
+    if ($code !== 0) {
+        fail("Command failed ({$code}): " . implode(' ', $command) . "\n" . implode("\n", $output));
+    }
+}
+
+function reloadService(string $service): void
+{
+    exec('systemctl reload ' . escapeshellarg($service) . ' 2>&1', $output, $code);
+    if ($code === 0) {
+        return;
+    }
+
+    exec('systemctl restart ' . escapeshellarg($service) . ' 2>&1', $restartOutput, $restartCode);
+    if ($restartCode !== 0) {
+        fail("Could not reload or restart {$service}\n" . implode("\n", array_merge($output, $restartOutput)));
+    }
+}
+
+function enableServiceIfAvailable(string $service): void
+{
+    exec('systemctl list-unit-files ' . escapeshellarg($service . '.service') . ' --no-legend 2>/dev/null', $output, $code);
+    if ($code === 0 && trim(implode("\n", $output)) !== '') {
+        runOrFail(['systemctl', 'enable', '--now', $service . '.service']);
+    }
+}
+
+function ensureWritableTargets(array $paths): void
+{
+    $blocked = [];
+    foreach ($paths as $path) {
+        $parent = dirname($path);
+        if ((is_file($path) && is_writable($path)) || (!file_exists($path) && is_dir($parent) && is_writable($parent))) {
+            continue;
+        }
+        $blocked[] = $path;
+    }
+
+    if ($blocked !== []) {
+        fail("This command cannot write required target(s). Re-run with sudo.\nTargets: " . implode(', ', $blocked));
+    }
+}
+
+function expandPath(string $path): string
+{
+    if ($path === '~') {
+        return (string) getenv('HOME');
+    }
+    if (str_starts_with($path, '~/')) {
+        return getenv('HOME') . substr($path, 1);
+    }
+    return $path;
+}
+
+function slugify(string $value): string
+{
+    $value = strtolower($value);
+    $value = preg_replace('/[^a-z0-9]+/', '-', $value) ?? $value;
+    $value = trim($value, '-');
+    return $value !== '' ? $value : 'app';
+}
+
+function nginxEscape(string $value): string
+{
+    return str_replace(['\\', '"'], ['\\\\', '\\"'], $value);
+}
+
+function fail(string $message): never
+{
+    throw new RuntimeException($message);
+}

@@ -1,0 +1,12 @@
+# Local machine configuration. Copy config.example.json to config.json.
+/config.json
+
+# Runtime/test output.
+/.php-dev-router.*
+/tmp/
+
+# Dependency and editor state.
+/vendor/
+/.idea/
+/.vscode/
+.DS_Store

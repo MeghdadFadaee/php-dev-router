@@ -1,0 +1,13 @@
+[Unit]
+Description=PHP development router
+After=network.target nginx.service php-fpm.service
+Wants=nginx.service php-fpm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/php /opt/php-dev-router/bin/php-dev-router watch --config=/etc/php-dev-router/config.json --interval=3
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

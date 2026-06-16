@@ -1,0 +1,22 @@
+{
+  "projects_root": "~/PhpstormProjects",
+  "domain": "php.test",
+  "ssl_certificate": "~/.ssl/php-dev-router/fullchain.pem",
+  "ssl_certificate_key": "~/.ssl/php-dev-router/privkey.pem",
+  "php_fpm_socket": "/run/php-fpm/php-fpm.sock",
+  "nginx_conf": "/etc/nginx/conf.d/php-dev-router.conf",
+  "hosts_file": "/etc/hosts",
+  "systemd_service": "/etc/systemd/system/php-dev-router.service",
+  "skip_dirs": [
+    ".cd",
+    ".git",
+    ".idea",
+    ".vscode",
+    "bootstrap/cache",
+    "node_modules",
+    "storage",
+    "vendor"
+  ],
+  "scan_max_depth": 5,
+  "watch_interval_seconds": 3
+}
