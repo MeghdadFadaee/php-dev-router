@@ -106,7 +106,7 @@ Usage:
   php-dev-router install [--dry-run]
 
 Commands:
-  scan      Discover PHP/Laravel apps and show hostnames.
+  scan      Discover PHP/Laravel/static apps and show hostnames.
   apply     Generate nginx config and exact local hosts entries.
   watch     Re-apply when the project inventory changes.
   doctor    Check config, certs, services, generated files, and DNS.
@@ -124,7 +124,7 @@ function commandScan(array $config, array $options): void
     }
 
     if ($apps === []) {
-        echo "No serveable PHP apps found in {$config['projects_root']}\n";
+        echo "No serveable PHP or static HTML apps found in {$config['projects_root']}\n";
         return;
     }
 
@@ -252,13 +252,14 @@ function discoverApps(array $config): array
             $host = "{$slug}-{$hash}.{$config['domain']}";
         }
         $usedHosts[$host] = true;
+        $indexFile = $candidate['index'] ?? 'index.php';
         $apps[] = [
             'host' => $host,
             'name' => $slug,
             'type' => $candidate['type'],
             'app_dir' => $candidate['app_dir'],
             'root' => $candidate['root'],
-            'index' => $candidate['root'] . '/index.php',
+            'index' => $candidate['root'] . "/{$indexFile}",
         ];
     }
 
@@ -275,9 +276,13 @@ function scanDirectory(string $dir, string $base, int $depth, array $config, arr
     $dir = rtrim($dir, '/');
     if (is_file("{$dir}/public/index.php")) {
         $type = is_file("{$dir}/artisan") ? 'laravel' : 'public-front-controller';
-        $candidates[] = ['app_dir' => $dir, 'root' => "{$dir}/public", 'type' => $type];
+        $candidates[] = ['app_dir' => $dir, 'root' => "{$dir}/public", 'type' => $type, 'index' => 'index.php'];
     } elseif (is_file("{$dir}/index.php")) {
-        $candidates[] = ['app_dir' => $dir, 'root' => $dir, 'type' => 'generic-php'];
+        $candidates[] = ['app_dir' => $dir, 'root' => $dir, 'type' => 'generic-php', 'index' => 'index.php'];
+    } elseif ($index = firstExistingFile($dir, ['public/index.html', 'public/index.htm'])) {
+        $candidates[] = ['app_dir' => $dir, 'root' => "{$dir}/public", 'type' => 'public-static-html', 'index' => basename($index)];
+    } elseif ($index = firstExistingFile($dir, ['index.html', 'index.htm'])) {
+        $candidates[] = ['app_dir' => $dir, 'root' => $dir, 'type' => 'static-html', 'index' => basename($index)];
     }
 
     $children = @scandir($dir);
@@ -315,6 +320,17 @@ function shouldSkip(string $path, string $base, array $skipDirs): bool
     return false;
 }
 
+function firstExistingFile(string $dir, array $files): ?string
+{
+    foreach ($files as $file) {
+        if (is_file("{$dir}/{$file}")) {
+            return $file;
+        }
+    }
+
+    return null;
+}
+
 function renderNginx(array $config, array $apps): string
 {
     $lines = [
@@ -329,6 +345,7 @@ function renderNginx(array $config, array $apps): string
         $cert = nginxEscape($config['ssl_certificate']);
         $key = nginxEscape($config['ssl_certificate_key']);
         $socket = nginxEscape($config['php_fpm_socket']);
+        $isStatic = isStaticApp($app);
 
         $lines[] = "server {";
         $lines[] = "    listen 80;";
@@ -344,20 +361,23 @@ function renderNginx(array $config, array $apps): string
         $lines[] = "    ssl_certificate_key \"{$key}\";";
         $lines[] = "";
         $lines[] = "    root \"{$root}\";";
-        $lines[] = "    index index.php index.html;";
+        $lines[] = $isStatic ? "    index index.html index.htm;" : "    index index.php index.html index.htm;";
         $lines[] = "";
         $lines[] = "    client_max_body_size 128m;";
         $lines[] = "";
         $lines[] = "    location / {";
-        $lines[] = "        try_files \$uri \$uri/ /index.php?\$query_string;";
+        $lines[] = $isStatic ? "        try_files \$uri \$uri/ =404;" : "        try_files \$uri \$uri/ /index.php?\$query_string;";
         $lines[] = "    }";
-        $lines[] = "";
-        $lines[] = "    location ~ \\.php$ {";
-        $lines[] = "        try_files \$uri =404;";
-        $lines[] = "        fastcgi_pass unix:{$socket};";
-        $lines[] = "        fastcgi_index index.php;";
-        $lines[] = "        include fastcgi.conf;";
-        $lines[] = "    }";
+
+        if (!$isStatic) {
+            $lines[] = "";
+            $lines[] = "    location ~ \\.php$ {";
+            $lines[] = "        try_files \$uri =404;";
+            $lines[] = "        fastcgi_pass unix:{$socket};";
+            $lines[] = "        fastcgi_index index.php;";
+            $lines[] = "        include fastcgi.conf;";
+            $lines[] = "    }";
+        }
         $lines[] = "";
         $lines[] = "    location ~ /\\.(?!well-known).* {";
         $lines[] = "        deny all;";
@@ -367,6 +387,11 @@ function renderNginx(array $config, array $apps): string
     }
 
     return implode("\n", $lines);
+}
+
+function isStaticApp(array $app): bool
+{
+    return in_array($app['type'], ['public-static-html', 'static-html'], true);
 }
 
 function renderHostsBlock(array $apps): string
